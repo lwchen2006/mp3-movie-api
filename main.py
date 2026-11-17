@@ -9,6 +9,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from data_pipeline import create_cleaning_report, process_data, validate_dataframe
 from src import (
     HealthResponse,
+    MovieCache,
     MovieDataResponse,
     MovieProcessingReport,
     MovieStorage,
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Movie API", version="1.0.0")
 app.middleware("http")(log_requests)
 storage = MovieStorage()
+cache = MovieCache()
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -71,6 +73,7 @@ async def upload_movies(file: UploadFile = File(...)):
         storage.save(df)
     except sqlite3.Error:
         raise HTTPException(status_code=500, detail="Failed to store movies")
+    cache.invalidate()
 
     logger.info("Uploaded movies: filename=%s, rows=%s", file.filename, len(df))
     return {
@@ -83,17 +86,22 @@ async def upload_movies(file: UploadFile = File(...)):
 
 @app.get("/movies", response_model=MovieDataResponse)
 def get_movies(limit: int = Query(default=100, ge=1)):
-    """Return up to limit stored movies and the total count."""
+    """Return up to limit stored movies and the total count (cached)."""
+    cached = cache.get(limit)
+    if cached is not None:
+        logger.info("Served movies from cache: limit=%s", limit)
+        return cached
+
     total_rows = storage.count_movies()
     if total_rows == 0:
-        logger.info("Retrieved movies: returned_rows=0")
-        return {"data": [], "total_rows": 0}
+        response = {"data": [], "total_rows": 0}
+    else:
+        data = storage.select_columns(list(MOVIE_COLUMNS), limit=limit)
+        response = {"data": data, "total_rows": total_rows}
 
-    data = storage.select_columns(list(MOVIE_COLUMNS), limit=limit)
-    logger.info(
-        "Retrieved movies: returned_rows=%s, total_rows=%s", len(data), total_rows
-    )
-    return {"data": data, "total_rows": total_rows}
+    cache.set(limit, response)
+    logger.info("Retrieved movies: returned_rows=%s", len(response["data"]))
+    return response
 
 
 @app.get("/movies/search", response_model=list[dict])
@@ -148,6 +156,7 @@ def process_movies(config: ProcessConfig):
         raise HTTPException(status_code=400, detail=str(error))
 
     storage.save(processed)
+    cache.invalidate()
     logger.info(
         "Processed movies: validation_removed=%s, rows_before=%s, rows_after=%s",
         validation_rows_removed,
